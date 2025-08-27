@@ -1,106 +1,89 @@
-// apu.js
-// Cycle-based NES APU with frame sequencer, envelopes, sweep, length/linear counters.
-// Includes a lightweight WebAudio sink (can be disabled).
+// apu.js — NES APU with accurate frame counter (4/5-step, IRQ), and DMC DMA + IRQ.
+// Exposes: write/read for $4000–$4017, step(cpuCycles), cpuIRQ(), setVolume(),
+// constructor({ cpuRead, cpuStall, onIRQ, sampleRate, useAudio }).
 
-/* ======================
-   Constants / Tables
-   ====================== */
+/* ===== Constants ===== */
+const NTSC_CPU_HZ = 1789773;                 // NTSC CPU
+const DEFAULT_SAMPLE_RATE = 48000;
 
-const NTSC_CPU_HZ = 1789773; // CPU master clock (NTSC)
-const DEFAULT_SAMPLE_RATE = 48000; // Audio output sample rate
-
-// Frame sequencer step intervals (CPU cycles) — approximate NTSC values.
-// Quarter frame every ~7457 cycles, half frame every ~14914 cycles.
-const STEP_INTERVAL = 7457;         // quarter-frame tick
-const HALF_STEP_INTERVAL = 14914;   // half-frame tick
-
-// Length counter table (index from writes to $4003/$4007/$400B/$400F upper 5 bits)
-const LENGTH_TABLE = [
-  10, 254, 20,  2, 40,  4, 80,  6,
-  160, 8, 60, 10, 14, 12, 26, 14,
-  12, 16, 24, 18, 48, 20, 96, 22,
-  192,24, 72, 26, 16, 28, 32, 30
-];
-
-// Noise period table (NTSC) in CPU cycles
-const NOISE_PERIODS = [
-   4,   8,  16,  32,  64,  96, 128, 160,
- 202, 254, 380, 508, 762, 1016, 2034, 4068
-];
-
-// DMC rates (NTSC) in CPU cycles (stubbed channel uses it for timing)
+// DMC rates in CPU cycles (NTSC)
 const DMC_RATES = [
   428, 380, 340, 320, 286, 254, 226, 214,
   190, 160, 142, 128, 106,  85,  72,  54
 ];
 
-// Helper
-const clamp01 = (x) => (x < 0 ? 0 : x > 1 ? 1 : x);
+const NOISE_PERIODS = [
+   4,   8,  16,  32,  64,  96, 128, 160,
+ 202, 254, 380, 508, 762, 1016, 2034, 4068
+];
 
-/* ======================
-   Envelope (shared by pulse/noise)
-   ====================== */
+const LENGTH_TABLE = [
+  10, 254, 20,  2, 40,  4, 80,  6,
+ 160,  8, 60, 10, 14, 12, 26, 14,
+  12, 16, 24, 18, 48, 20, 96, 22,
+ 192, 24, 72, 26, 16, 28, 32, 30
+];
+
+const clamp01 = (x) => x < 0 ? 0 : x > 1 ? 1 : x;
+
+/* ===== Shared units ===== */
 class Envelope {
   constructor() {
-    this.loop = false;          // if true, decay loops (a.k.a. length-halt)
+    this.loop = false;
     this.constantVolume = false;
-    this.volume = 0;            // 0..15 (also "envelope period")
-    this.startFlag = false;
-
-    this.decayLevel = 0;        // 0..15
+    this.volume = 0;
+    this.start = false;
+    this.decay = 0;
     this.divider = 0;
   }
-
   write(n) {
-    this.loop = !!(n & 0x20);               // also acts as length counter halt
+    this.loop = !!(n & 0x20);
     this.constantVolume = !!(n & 0x10);
     this.volume = n & 0x0F;
   }
-
-  restart() {
-    this.startFlag = true;
-  }
-
-  quarterFrameTick() {
-    if (this.startFlag) {
-      this.startFlag = false;
-      this.decayLevel = 15;
+  restart() { this.start = true; }
+  quarter() {
+    if (this.start) {
+      this.start = false;
+      this.decay = 15;
       this.divider = this.volume;
     } else {
       if (this.divider === 0) {
         this.divider = this.volume;
-        if (this.decayLevel > 0) {
-          this.decayLevel--;
-        } else if (this.loop) {
-          this.decayLevel = 15;
-        }
+        if (this.decay > 0) this.decay--;
+        else if (this.loop) this.decay = 15;
       } else {
         this.divider--;
       }
     }
   }
-
-  output() {
-    return this.constantVolume ? this.volume : this.decayLevel;
+  out() {
+    return this.constantVolume ? this.volume : this.decay;
   }
 }
 
-/* ======================
-   Sweep (Pulse only)
-   ====================== */
+class LengthCounter {
+  constructor() {
+    this.value = 0;
+    this.halt = false;
+  }
+  load(index) { this.value = LENGTH_TABLE[index & 0x1F] || 0; }
+  half() { if (!this.halt && this.value > 0) this.value--; }
+  zero() { return this.value === 0; }
+}
+
+/* ===== Pulse (x2) ===== */
 class Sweep {
-  constructor(pulse) {
+  constructor(pulse, isPulse1) {
     this.pulse = pulse;
+    this.isPulse1 = isPulse1;
     this.enabled = false;
     this.period = 0;
     this.negate = false;
     this.shift = 0;
-
     this.counter = 0;
     this.reload = false;
-    this.mute = false;
   }
-
   write(n) {
     this.enabled = !!(n & 0x80);
     this.period = (n >> 4) & 0x07;
@@ -108,34 +91,24 @@ class Sweep {
     this.shift = n & 0x07;
     this.reload = true;
   }
-
-  targetPeriod() {
+  target() {
     const p = this.pulse.timer;
     const change = p >> this.shift;
-    if (this.shift === 0) return p; // no change
-    // Channel 1 has extra -1 on negate (hardware quirk) — emulate both the same for simplicity
-    let target = this.negate ? (p - change) : (p + change);
-    return target;
+    if (this.shift === 0) return p;
+    let t = this.negate ? (p - change) : (p + change);
+    if (this.negate && this.isPulse1) t -= 1; // pulse1 quirk
+    return t;
   }
-
-  halfFrameTick() {
-    if (!this.enabled || this.shift === 0) {
-      if (this.reload) this.counter = this.period;
-      this.reload = false;
-      return;
-    }
-
+  half() {
     if (this.counter === 0) {
-      this.counter = this.period;
-      const t = this.targetPeriod();
-      // Hardware mutes if target >= 0x800 or current timer < 8
-      if (t < 0x800 && this.pulse.timer >= 8) {
-        this.pulse.timer = t;
+      if (this.enabled && this.shift !== 0) {
+        const t = this.target();
+        if (t < 0x800 && this.pulse.timer >= 8) this.pulse.timer = t;
       }
+      this.counter = this.period;
     } else {
       this.counter--;
     }
-
     if (this.reload) {
       this.counter = this.period;
       this.reload = false;
@@ -143,415 +116,321 @@ class Sweep {
   }
 }
 
-/* ======================
-   Length Counter
-   ====================== */
-class LengthCounter {
-  constructor() {
-    this.value = 0;
-    this.halt = false; // from envelope.loop bit
-  }
-  set(index5bit) {
-    this.value = LENGTH_TABLE[index5bit & 0x1F] || 0;
-  }
-  halfFrameTick() {
-    if (!this.halt && this.value > 0) this.value--;
-  }
-  isZero() { return this.value === 0; }
-}
-
-/* ======================
-   Pulse Channel (x2)
-   ====================== */
 class Pulse {
-  constructor(channelIndex) {
-    this.ch = channelIndex; // 0 or 1
+  constructor(isPulse1) {
     this.enabled = false;
-
-    this.envelope = new Envelope();
-    this.length = new LengthCounter();
-    this.sweep = new Sweep(this);
-
-    // Duty: 0..3 => 12.5%, 25%, 50%, 75%
+    this.env = new Envelope();
+    this.len = new LengthCounter();
+    this.sweep = new Sweep(this, isPulse1);
     this.duty = 0;
     this.dutyStep = 0;
-
-    // Timer (period): 11-bit
     this.timer = 0;
-    this.timerCounter = 0;
-
-    this.length.halt = false; // mirrors envelope.loop
+    this.timerCnt = 0;
   }
-
-  write0(n) {
-    this.envelope.write(n);
-    this.length.halt = this.envelope.loop;
-    this.duty = (n >> 6) & 0x03;
-  }
+  write0(n) { this.env.write(n); this.len.halt = this.env.loop; this.duty = (n >> 6) & 3; }
   write1(n) { this.sweep.write(n); }
   write2(n) { this.timer = (this.timer & 0x700) | n; }
   write3(n) {
-    this.timer = (this.timer & 0x0FF) | ((n & 0x07) << 8);
-    if (this.enabled) this.length.set((n >> 3) & 0x1F);
-    this.envelope.restart();
+    this.timer = (this.timer & 0x0FF) | ((n & 7) << 8);
+    if (this.enabled) this.len.load((n >> 3) & 0x1F);
+    this.env.restart();
     this.dutyStep = 0;
   }
-
-  setEnabled(on) {
-    this.enabled = !!on;
-    if (!this.enabled) this.length.value = 0;
-  }
-
-  quarterFrameTick() {
-    this.envelope.quarterFrameTick();
-  }
-
-  halfFrameTick() {
-    this.length.halfFrameTick();
-    this.sweep.halfFrameTick();
-  }
-
-  // Clock at CPU cycle granularity
+  setEnabled(on) { this.enabled = !!on; if (!this.enabled) this.len.value = 0; }
+  quarter() { this.env.quarter(); }
+  half() { this.len.half(); this.sweep.half(); }
   clock() {
-    if (this.timer < 8) return; // hardware mute
-    if (this.timerCounter === 0) {
-      this.timerCounter = this.timer;
+    if (this.timerCnt === 0) {
+      this.timerCnt = this.timer;
       this.dutyStep = (this.dutyStep + 1) & 7;
-    } else {
-      this.timerCounter--;
-    }
+    } else this.timerCnt--;
   }
-
-  output() {
-    if (!this.enabled || this.length.isZero() || this.timer < 8 || this.sweep.mute) return 0;
-
-    // NES duty sequences
-    // 12.5%: 00000001
-    // 25%:   00000011
-    // 50%:   00001111
-    // 75%:   11111100
-    const DUTY_TABLE = [
+  out() {
+    if (!this.enabled || this.len.zero() || this.timer < 8) return 0;
+    const DUTY = [
       [0,0,0,0,0,0,0,1],
       [0,0,0,0,0,0,1,1],
       [0,0,0,0,1,1,1,1],
       [1,1,1,1,1,1,0,0],
     ];
-    const on = DUTY_TABLE[this.duty][this.dutyStep];
-    if (!on) return 0;
-    return this.envelope.output(); // 0..15
+    const gate = DUTY[this.duty][this.dutyStep];
+    return gate ? this.env.out() : 0;
   }
 }
 
-/* ======================
-   Triangle Channel
-   ====================== */
+/* ===== Triangle ===== */
 class Triangle {
   constructor() {
     this.enabled = false;
-    this.length = new LengthCounter();
-
-    // Linear counter
-    this.control = false; // also length halt
-    this.linearReloadValue = 0;
-    this.linearCounter = 0;
+    this.len = new LengthCounter();
+    this.control = false; // ties to len.halt
+    this.linearReload = 0;
+    this.linear = 0;
     this.reloadFlag = false;
-
-    // Timer
     this.timer = 0;
-    this.timerCounter = 0;
-
-    this.seqStep = 0; // 0..31
+    this.timerCnt = 0;
+    this.step = 0;
   }
-
-  write0(n) {
-    this.control = !!(n & 0x80);
-    this.length.halt = this.control; // tie to length halt bit
-    this.linearReloadValue = n & 0x7F;
-  }
+  write0(n) { this.control = !!(n & 0x80); this.len.halt = this.control; this.linearReload = n & 0x7F; }
   write2(n) { this.timer = (this.timer & 0x700) | n; }
   write3(n) {
-    this.timer = (this.timer & 0x0FF) | ((n & 0x07) << 8);
-    if (this.enabled) this.length.set((n >> 3) & 0x1F);
+    this.timer = (this.timer & 0x0FF) | ((n & 7) << 8);
+    if (this.enabled) this.len.load((n >> 3) & 0x1F);
     this.reloadFlag = true;
   }
-
-  setEnabled(on) {
-    this.enabled = !!on;
-    if (!this.enabled) this.length.value = 0;
-  }
-
-  quarterFrameTick() {
-    if (this.reloadFlag) {
-      this.linearCounter = this.linearReloadValue;
-    } else if (this.linearCounter > 0) {
-      this.linearCounter--;
-    }
+  setEnabled(on) { this.enabled = !!on; if (!this.enabled) this.len.value = 0; }
+  quarter() {
+    if (this.reloadFlag) this.linear = this.linearReload;
+    else if (this.linear > 0) this.linear--;
     if (!this.control) this.reloadFlag = false;
   }
-
-  halfFrameTick() {
-    this.length.halfFrameTick();
-  }
-
+  half() { this.len.half(); }
   clock() {
-    if (this.timerCounter === 0) {
-      this.timerCounter = this.timer;
-      if (!this.length.isZero() && this.linearCounter > 0) {
-        this.seqStep = (this.seqStep + 1) & 31;
-      }
-    } else {
-      this.timerCounter--;
-    }
+    if (this.timerCnt === 0) {
+      this.timerCnt = this.timer;
+      if (!this.len.zero() && this.linear > 0) this.step = (this.step + 1) & 31;
+    } else this.timerCnt--;
   }
-
-  output() {
-    if (!this.enabled || this.length.isZero() || this.linearCounter === 0 || this.timer < 2) return 0;
-    // 32-step triangle table (0..15..0)
-    const TRI_TABLE = [
+  out() {
+    if (!this.enabled || this.len.zero() || this.linear === 0 || this.timer < 2) return 0;
+    const TRI = [
       15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0,
        0, 1, 2, 3, 4, 5,6,7,8,9,10,11,12,13,14,15
     ];
-    return TRI_TABLE[this.seqStep];
+    return TRI[this.step];
   }
 }
 
-/* ======================
-   Noise Channel
-   ====================== */
+/* ===== Noise ===== */
 class Noise {
   constructor() {
     this.enabled = false;
-
-    this.envelope = new Envelope();
-    this.length = new LengthCounter();
-
-    this.mode = 0;  // 0 = long, 1 = short LFSR tap
-    this.periodIndex = 0;
-
-    this.timerCounter = 0;
-    this.lfsr = 1;  // 15-bit LFSR; initial nonzero
+    this.env = new Envelope();
+    this.len = new LengthCounter();
+    this.mode = 0;
+    this.periodIdx = 0;
+    this.timerCnt = 0;
+    this.lfsr = 1;
   }
-
-  write0(n) {
-    this.envelope.write(n);
-    this.length.halt = this.envelope.loop;
-  }
-  write2(n) {
-    this.mode = (n & 0x80) ? 1 : 0;
-    this.periodIndex = n & 0x0F;
-  }
-  write3(n) {
-    if (this.enabled) this.length.set((n >> 3) & 0x1F);
-    this.envelope.restart();
-  }
-
-  setEnabled(on) {
-    this.enabled = !!on;
-    if (!this.enabled) this.length.value = 0;
-  }
-
-  quarterFrameTick() {
-    this.envelope.quarterFrameTick();
-  }
-
-  halfFrameTick() {
-    this.length.halfFrameTick();
-  }
-
+  write0(n) { this.env.write(n); this.len.halt = this.env.loop; }
+  write2(n) { this.mode = (n & 0x80) ? 1 : 0; this.periodIdx = n & 0x0F; }
+  write3(n) { if (this.enabled) this.len.load((n >> 3) & 0x1F); this.env.restart(); }
+  setEnabled(on) { this.enabled = !!on; if (!this.enabled) this.len.value = 0; }
+  quarter() { this.env.quarter(); }
+  half() { this.len.half(); }
   clock() {
-    if (this.timerCounter === 0) {
-      this.timerCounter = NOISE_PERIODS[this.periodIndex] || 4;
-      // Feedback bit taps: mode 0 => bit 1; mode 1 => bit 6
+    if (this.timerCnt === 0) {
+      this.timerCnt = NOISE_PERIODS[this.periodIdx] || 4;
       const bit0 = this.lfsr & 1;
       const tap = this.mode ? ((this.lfsr >> 6) & 1) : ((this.lfsr >> 1) & 1);
-      const feedback = bit0 ^ tap;
-      this.lfsr = (this.lfsr >> 1) | (feedback << 14);
-    } else {
-      this.timerCounter--;
-    }
+      const fb = bit0 ^ tap;
+      this.lfsr = (this.lfsr >> 1) | (fb << 14);
+    } else this.timerCnt--;
   }
-
-  output() {
-    if (!this.enabled || this.length.isZero() || (this.lfsr & 1)) return 0; // bit0=1 => output 0
-    return this.envelope.output();
+  out() {
+    if (!this.enabled || this.len.zero() || (this.lfsr & 1)) return 0;
+    return this.env.out();
   }
 }
 
-/* ======================
-   DMC (minimal stub)
-   ====================== */
+/* ===== DMC (DMA, IRQ, correct buffering) ===== */
 class DMC {
-  constructor(readCpuByte) {
+  constructor(cpuRead, cpuStall) {
     this.enabled = false;
-    this.irqEnabled = false;
+    this.irqEnable = false;
     this.loop = false;
+    this.rateIdx = 0;
 
-    this.rateIndex = 0;
-    this.timer = 0;
-    this.timerCounter = 0;
+    this.timer = DMC_RATES[0];
+    this.timerCnt = 0;
 
-    // Sample memory
-    this.sampleAddr = 0xC000;
-    this.sampleLen = 1;
-    this.bytesRemaining = 0;
+    // Sample settings
+    this.sampleAddr0 = 0xC000;
+    this.sampleLen0 = 1;
+
+    // Playback state
     this.currentAddr = 0;
+    this.bytesRemaining = 0;
 
-    // Output unit
-    this.outputLevel = 0; // 0..127 (blended in mixer)
+    // Buffering / shifter
+    this.sampleBufferEmpty = true;
+    this.sampleBuffer = 0;
     this.shiftReg = 0;
     this.bitsRemaining = 0;
-    this.buffer = null;   // holds next byte
-    this.bufferEmpty = true;
 
-    this.readCpu = readCpuByte || (() => 0); // you can pass a cpu read callback
+    // Output DAC
+    this.dac = 0; // 0..127
+
+    // IRQ
+    this.irq = false;
+
+    // CPU hooks
+    this.cpuRead = cpuRead || (() => 0);
+    this.cpuStall = cpuStall || (() => {});
   }
 
   write0(n) {
-    this.irqEnabled = !!(n & 0x80);
+    this.irqEnable = !!(n & 0x80);
+    if (!this.irqEnable) this.irq = false; // disabling IRQ clears flag
     this.loop = !!(n & 0x40);
-    this.rateIndex = n & 0x0F;
-    this.timer = DMC_RATES[this.rateIndex] || 428;
+    this.rateIdx = n & 0x0F;
+    this.timer = DMC_RATES[this.rateIdx] || 428;
   }
-  write1(n) {
-    this.outputLevel = n & 0x7F;
-  }
-  write2(n) {
-    this.sampleAddr = 0xC000 + ((n & 0xFF) << 6);
-  }
-  write3(n) {
-    this.sampleLen = ((n & 0xFF) << 4) + 1;
-  }
+  write1(n) { this.dac = n & 0x7F; }
+  write2(n) { this.sampleAddr0 = 0xC000 + ((n & 0xFF) << 6); }
+  write3(n) { this.sampleLen0 = ((n & 0xFF) << 4) + 1; }
 
   setEnabled(on) {
     const was = this.enabled;
     this.enabled = !!on;
-    if (!was && this.enabled) {
-      this.currentAddr = this.sampleAddr;
-      this.bytesRemaining = this.sampleLen;
+    if (this.enabled && !was) {
+      if (this.bytesRemaining === 0) {
+        this.currentAddr = this.sampleAddr0;
+        this.bytesRemaining = this.sampleLen0;
+      }
     } else if (!this.enabled) {
       this.bytesRemaining = 0;
+      this.irq = false;
     }
   }
 
-  // VERY simplified DMC timing; plays steady tone-ish, enough to keep mixer stable.
+  // Fetch a byte into sampleBuffer if empty & data remaining (steals 4 CPU cycles)
+  refillBufferIfNeeded() {
+    if (!this.sampleBufferEmpty || this.bytesRemaining === 0) return;
+    // DMC DMA read
+    const data = this.cpuRead(this.currentAddr & 0xFFFF) & 0xFF;
+    this.cpuStall(4); // DMC steals 4 CPU cycles per fetch (NTSC)
+    this.sampleBuffer = data;
+    this.sampleBufferEmpty = false;
+    this.currentAddr = (this.currentAddr + 1) & 0xFFFF;
+    this.bytesRemaining--;
+    if (this.bytesRemaining === 0 && this.loop) {
+      this.currentAddr = this.sampleAddr0;
+      this.bytesRemaining = this.sampleLen0;
+    } else if (this.bytesRemaining === 0 && this.irqEnable) {
+      this.irq = true;
+    }
+  }
+
   clock() {
-    if (!this.enabled) return;
-    if (this.timerCounter === 0) {
-      this.timerCounter = this.timer;
+    // Always try to keep buffer filled
+    this.refillBufferIfNeeded();
+
+    if (this.timerCnt === 0) {
+      this.timerCnt = this.timer;
 
       if (this.bitsRemaining === 0) {
-        if (this.bufferEmpty && this.bytesRemaining > 0) {
-          this.buffer = this.readCpu(this.currentAddr & 0xFFFF);
-          this.bufferEmpty = false;
-          this.currentAddr = (this.currentAddr + 1) & 0xFFFF;
-          this.bytesRemaining--;
-          if (this.bytesRemaining === 0 && this.loop) {
-            this.currentAddr = this.sampleAddr;
-            this.bytesRemaining = this.sampleLen;
-          }
-        }
-        if (!this.bufferEmpty) {
-          this.shiftReg = this.buffer;
-          this.bufferEmpty = true;
+        if (!this.sampleBufferEmpty) {
+          this.shiftReg = this.sampleBuffer;
+          this.sampleBufferEmpty = true;
           this.bitsRemaining = 8;
+          // Attempt to fetch next byte ASAP (matches HW behavior closely)
+          this.refillBufferIfNeeded();
+        } else {
+          // silence when no data
         }
       } else {
-        // Output unit: 1 => +2, 0 => -2
+        // Output unit: if bit1 => +2, else -2
         if (this.shiftReg & 1) {
-          if (this.outputLevel <= 125) this.outputLevel += 2;
+          if (this.dac <= 125) this.dac += 2;
         } else {
-          if (this.outputLevel >= 2) this.outputLevel -= 2;
+          if (this.dac >= 2) this.dac -= 2;
         }
         this.shiftReg >>= 1;
         this.bitsRemaining--;
       }
+
     } else {
-      this.timerCounter--;
+      this.timerCnt--;
     }
   }
 
-  output() {
-    return this.outputLevel; // 0..127
-  }
+  out() { return this.dac; }
+
+  statusActiveBit() { return (this.bytesRemaining > 0) ? 1 : 0; }
 }
 
-/* ======================
-   APU Mixer + Frame Sequencer
-   ====================== */
+/* ===== APU Core ===== */
 export default class APU {
-  constructor({ sampleRate = DEFAULT_SAMPLE_RATE, cpuRead = null, useAudio = true } = {}) {
+  constructor({ cpuRead, cpuStall, onIRQ, sampleRate = DEFAULT_SAMPLE_RATE, useAudio = true } = {}) {
     // Channels
-    this.pulse1 = new Pulse(0);
-    this.pulse2 = new Pulse(1);
+    this.pulse1 = new Pulse(true);
+    this.pulse2 = new Pulse(false);
     this.triangle = new Triangle();
     this.noise = new Noise();
-    this.dmc = new DMC(cpuRead);
+    this.dmc = new DMC(cpuRead, cpuStall);
 
-    // Frame sequencer (we implement a 4-step mode without IRQ for simplicity)
-    this.frameCounter = 0;
-    this.fcCycles = 0; // cycles accumulated since last quarter-frame
-    this.mode5 = false; // if true, 5-step (we still run quarter/half without IRQs)
-    this.irqInhibit = true; // we don't generate IRQs in this simplified core
+    // IRQ lines
+    this.frameIRQ = false; // bit6 in $4015
+    this.onIRQ = typeof onIRQ === "function" ? onIRQ : null;
 
-    // Audio / resampling
-    this.cpuCycles = 0;
+    // Frame counter/sequencer
+    this.mode5 = false;    // false=4-step, true=5-step
+    this.irqInhibit = true;
+    this.seqTime = 0;      // CPU cycles (float to keep .5)
+    // Quarter frame base period:
+    this.qPeriod = NTSC_CPU_HZ / 240; // ≈ 7457.3875 CPU cycles
+
+    // Audio sampling
+    this.master = 0.3;
     this.sampleRate = sampleRate;
     this.samplePeriod = NTSC_CPU_HZ / this.sampleRate;
     this.sampleTimer = 0;
 
-    // Master volume
-    this.master = 0.3;
-
-    // Optional WebAudio sink (simple ring-buffer -> ScriptProcessor)
+    // Optional WebAudio sink
     this.audioEnabled = false;
-    if (useAudio && (typeof window !== "undefined")) {
-      this._initWebAudio(sampleRate);
-    }
+    if (useAudio && typeof window !== "undefined") this._initWebAudio(sampleRate);
   }
 
-  /* -------- Bus I/O: $4000–$4017 -------- */
-  write(addr, val) {
-    val &= 0xFF;
+  /* ==== Bus I/O ==== */
+  write(addr, v) {
+    v &= 0xFF;
     switch (addr) {
       // Pulse 1
-      case 0x4000: this.pulse1.write0(val); break;
-      case 0x4001: this.pulse1.write1(val); break;
-      case 0x4002: this.pulse1.write2(val); break;
-      case 0x4003: this.pulse1.write3(val); break;
+      case 0x4000: this.pulse1.write0(v); break;
+      case 0x4001: this.pulse1.write1(v); break;
+      case 0x4002: this.pulse1.write2(v); break;
+      case 0x4003: this.pulse1.write3(v); break;
       // Pulse 2
-      case 0x4004: this.pulse2.write0(val); break;
-      case 0x4005: this.pulse2.write1(val); break;
-      case 0x4006: this.pulse2.write2(val); break;
-      case 0x4007: this.pulse2.write3(val); break;
+      case 0x4004: this.pulse2.write0(v); break;
+      case 0x4005: this.pulse2.write1(v); break;
+      case 0x4006: this.pulse2.write2(v); break;
+      case 0x4007: this.pulse2.write3(v); break;
       // Triangle
-      case 0x4008: this.triangle.write0(val); break;
-      case 0x400A: this.triangle.write2(val); break;
-      case 0x400B: this.triangle.write3(val); break;
+      case 0x4008: this.triangle.write0(v); break;
+      case 0x400A: this.triangle.write2(v); break;
+      case 0x400B: this.triangle.write3(v); break;
       // Noise
-      case 0x400C: this.noise.write0(val); break;
-      case 0x400E: this.noise.write2(val); break;
-      case 0x400F: this.noise.write3(val); break;
+      case 0x400C: this.noise.write0(v); break;
+      case 0x400E: this.noise.write2(v); break;
+      case 0x400F: this.noise.write3(v); break;
       // DMC
-      case 0x4010: this.dmc.write0(val); break;
-      case 0x4011: this.dmc.write1(val); break;
-      case 0x4012: this.dmc.write2(val); break;
-      case 0x4013: this.dmc.write3(val); break;
+      case 0x4010: this.dmc.write0(v); break;
+      case 0x4011: this.dmc.write1(v); break;
+      case 0x4012: this.dmc.write2(v); break;
+      case 0x4013: this.dmc.write3(v); break;
 
-      case 0x4015: // Channel enables
-        this.pulse1.setEnabled(val & 0x01);
-        this.pulse2.setEnabled(val & 0x02);
-        this.triangle.setEnabled(val & 0x04);
-        this.noise.setEnabled(val & 0x08);
-        this.dmc.setEnabled(val & 0x10);
+      case 0x4015: { // channel enables
+        this.pulse1.setEnabled(v & 1);
+        this.pulse2.setEnabled(v & 2);
+        this.triangle.setEnabled(v & 4);
+        this.noise.setEnabled(v & 8);
+        const enableDmc = !!(v & 0x10);
+        this.dmc.setEnabled(enableDmc);
+        if (!enableDmc) this.dmc.irq = false; // disabling clears DMC IRQ flag
+        this._updateIRQLine();
         break;
+      }
 
-      case 0x4017: { // Frame counter
-        this.mode5 = !!(val & 0x80);
-        this.irqInhibit = !!(val & 0x40);
-        // Immediately clock a quarter/half on write in 5-step mode (hardware quirk),
-        // we emulate by resetting counters.
-        this.fcCycles = 0;
-        this.frameCounter = 0;
+      case 0x4017: { // Frame counter control
+        this.mode5 = !!(v & 0x80);
+        this.irqInhibit = !!(v & 0x40);
+        if (this.irqInhibit) this.frameIRQ = false; // inhibit clears frame IRQ
+        // Reset sequencer time
+        this.seqTime = 0;
+        // In 5-step mode, immediately clock quarter+half (hardware quirk)
+        if (this.mode5) this._clockQuarterHalf();
+        this._updateIRQLine();
         break;
       }
 
@@ -560,76 +439,93 @@ export default class APU {
   }
 
   read(addr) {
-    if (addr === 0x4015) {
-      // Return channel status (simplified; no IRQ flags)
-      return (this.pulse1.length.isZero() ? 0 : 1) |
-             (this.pulse2.length.isZero() ? 0 : 2) |
-             (this.triangle.length.isZero() ? 0 : 4) |
-             (this.noise.length.isZero() ? 0 : 8) |
-             (this.dmc.enabled ? 16 : 0);
-    }
-    return 0;
+    if (addr !== 0x4015) return 0;
+    const p1 = this.pulse1.len.zero() ? 0 : 1;
+    const p2 = this.pulse2.len.zero() ? 0 : 2;
+    const tri = this.triangle.len.zero() ? 0 : 4;
+    const noi = this.noise.len.zero() ? 0 : 8;
+    const dmcActive = this.dmc.statusActiveBit() ? 16 : 0;
+    const frameIrqBit = this.frameIRQ ? 0x40 : 0;
+    const dmcIrqBit = this.dmc.irq ? 0x80 : 0;
+    const val = p1 | p2 | tri | noi | dmcActive | frameIrqBit | dmcIrqBit;
+    // Reading $4015 clears IRQ flags
+    this.frameIRQ = false;
+    this.dmc.irq = false;
+    this._updateIRQLine();
+    return val;
   }
 
-  /* -------- Main stepping -------- */
-  // Call with the number of CPU cycles you just executed.
+  /* ==== Step timing ==== */
   step(cycles) {
     for (let i = 0; i < cycles; i++) {
-      // Tick channel timers once per CPU cycle
+      // Clock channels once per CPU cycle
       this.pulse1.clock();
       this.pulse2.clock();
       this.triangle.clock();
       this.noise.clock();
       this.dmc.clock();
 
-      // Frame sequencer timing
-      this.fcCycles++;
-      let quarter = false, half = false;
+      // Frame sequencer position (float to catch .5 cycle boundaries)
+      this.seqTime += 1;
 
-      if (this.fcCycles === STEP_INTERVAL) {
-        quarter = true;
-      } else if (this.fcCycles === HALF_STEP_INTERVAL) {
-        quarter = true; half = true;
-      } else if (this.fcCycles === (STEP_INTERVAL * 3)) {
-        quarter = true;
-      } else if (this.fcCycles === (HALF_STEP_INTERVAL * 2)) {
-        // end of 4-step sequence (~29829 cycles)
-        quarter = true; half = true;
-        this.fcCycles = 0;
+      // Quarter-frame ticks at 1×, 2×, 3×, 4×; half-frame at 2×, 4×.
+      const t = this.seqTime;
+      // Using thresholds based on qPeriod multiples
+      const q1 = this.qPeriod * 1;
+      const q2 = this.qPeriod * 2;
+      const q3 = this.qPeriod * 3;
+      const q4 = this.qPeriod * 4;
+
+      // We tick when crossing each boundary (>=) and then mark so we don't tick twice.
+      // Implement using integer "phase": 0..3 for 4-step, 0..3 then wrap for 5-step.
+      if (!this._phase) this._phase = 0;
+
+      if (this._phase === 0 && t >= q1) { this._clockQuarter(); this._phase = 1; }
+      if (this._phase === 1 && t >= q2) { this._clockQuarterHalf(); this._phase = 2; }
+      if (this._phase === 2 && t >= q3) { this._clockQuarter(); this._phase = 3; }
+      if (this._phase === 3 && t >= q4) {
+        this._clockQuarterHalf();
+        // End-of-sequence behavior:
+        if (!this.mode5 && !this.irqInhibit) this.frameIRQ = true; // 4-step raises frame IRQ
+        this._updateIRQLine();
+        // Restart sequence
+        this.seqTime -= q4; // keep fractional remainder (if any)
+        this._phase = 0;
+        // 5-step has no extra tick here (we already did Q+H above)
       }
 
-      if (quarter) {
-        this.pulse1.quarterFrameTick();
-        this.pulse2.quarterFrameTick();
-        this.triangle.quarterFrameTick();
-        this.noise.quarterFrameTick();
-      }
-      if (half) {
-        this.pulse1.halfFrameTick();
-        this.pulse2.halfFrameTick();
-        this.triangle.halfFrameTick();
-        this.noise.halfFrameTick();
-      }
-
-      // Resampling: generate audio sample at output rate
+      // Resample to audio
       this.sampleTimer += 1;
       if (this.sampleTimer >= this.samplePeriod) {
         this.sampleTimer -= this.samplePeriod;
-        const s = this.mixSample();
+        const s = this._mix();
         if (this.audioEnabled) this._pushSample(s);
-        if (this.onSample) this.onSample(s); // optional callback
+        if (this.onSample) this.onSample(s);
       }
     }
   }
 
-  /* -------- Mixer -------- */
-  // Based on common non-linear NES mixer approximations
-  mixSample() {
-    const p1 = this.pulse1.output();
-    const p2 = this.pulse2.output();
-    const tri = this.triangle.output();
-    const noi = this.noise.output();
-    const dmc = this.dmc.output();
+  _clockQuarter() {
+    this.pulse1.quarter();
+    this.pulse2.quarter();
+    this.triangle.quarter();
+    this.noise.quarter();
+  }
+  _clockQuarterHalf() {
+    this._clockQuarter();
+    this.pulse1.half();
+    this.pulse2.half();
+    this.triangle.half();
+    this.noise.half();
+  }
+
+  /* ==== Mixer (non-linear approximation) ==== */
+  _mix() {
+    const p1 = this.pulse1.out();
+    const p2 = this.pulse2.out();
+    const tri = this.triangle.out();
+    const noi = this.noise.out();
+    const dmc = this.dmc.out();
 
     let pulseTerm = 0;
     if (p1 || p2) pulseTerm = 95.88 / ((8128 / (p1 + p2)) + 100);
@@ -638,13 +534,20 @@ export default class APU {
     const tnd = (tri / 8227) + (noi / 12241) + (dmc / 22638);
     if (tnd) tndTerm = 159.79 / ((1 / tnd) + 100);
 
-    const mixed = (pulseTerm + tndTerm) * this.master; // 0..~1
-    return mixed * 2 - 1; // convert to -1..+1 for WebAudio
+    const mixed = (pulseTerm + tndTerm) * this.master;
+    return mixed * 2 - 1;
   }
 
   setVolume(v) { this.master = clamp01(v); }
 
-  /* -------- Optional WebAudio sink -------- */
+  /* ==== IRQ line helper ==== */
+  _updateIRQLine() {
+    const asserted = this.dmc.irq || this.frameIRQ;
+    if (this.onIRQ) this.onIRQ(asserted);
+  }
+  cpuIRQ() { return this.dmc.irq || this.frameIRQ; }
+
+  /* ==== WebAudio sink (optional) ==== */
   _initWebAudio(sampleRate) {
     try {
       const ACtx = window.AudioContext || window.webkitAudioContext;
@@ -652,45 +555,35 @@ export default class APU {
       this.sampleRate = this.ctx.sampleRate;
       this.samplePeriod = NTSC_CPU_HZ / this.sampleRate;
 
-      // ScriptProcessorNode (deprecated but widely supported)
-      const BUFFER_SIZE = 2048;
-      this.proc = this.ctx.createScriptProcessor(BUFFER_SIZE, 0, 1);
+      const BUFFER = 2048;
+      this.rb = new Float32Array(BUFFER * 8);
+      this.rw = 0; this.rr = 0;
+
+      this.proc = this.ctx.createScriptProcessor(BUFFER, 0, 1);
       this.proc.onaudioprocess = (e) => {
         const out = e.outputBuffer.getChannelData(0);
-        for (let i = 0; i < out.length; i++) {
-          out[i] = this._dequeueSample();
-        }
+        for (let i = 0; i < out.length; i++) out[i] = this._deq();
       };
       this.gain = this.ctx.createGain();
       this.gain.gain.value = 1.0;
       this.proc.connect(this.gain);
       this.gain.connect(this.ctx.destination);
-
-      // ring buffer for samples
-      this._rb = new Float32Array(BUFFER_SIZE * 8);
-      this._rbW = 0; this._rbR = 0;
-
       this.audioEnabled = true;
-      // Autoresume on user gesture elsewhere if needed
     } catch {
       this.audioEnabled = false;
     }
   }
-
   _pushSample(s) {
-    const next = (this._rbW + 1) % this._rb.length;
-    if (next !== this._rbR) { // avoid overrun
-      this._rb[this._rbW] = s;
-      this._rbW = next;
-    }
+    const next = (this.rw + 1) % this.rb.length;
+    if (next !== this.rr) { this.rb[this.rw] = s; this.rw = next; }
   }
-  _dequeueSample() {
-    if (this._rbR === this._rbW) return 0;
-    const s = this._rb[this._rbR];
-    this._rbR = (this._rbR + 1) % this._rb.length;
+  _deq() {
+    if (this.rr === this.rw) return 0;
+    const s = this.rb[this.rr];
+    this.rr = (this.rr + 1) % this.rb.length;
     return s;
-    }
+  }
 
-  // Optional: external sample callback
+  // Optional external sample callback
   onSample = null;
 }
