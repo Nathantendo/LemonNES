@@ -1,2 +1,2 @@
 # LemonNES
-Simple NES Emulator In JS and HTML
+Simple And In-Development NES Emulator
