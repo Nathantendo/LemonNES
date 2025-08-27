@@ -175,4 +175,9 @@ function updateUI(player, keyMap) {
 }
 
 // Load saved mappings on start
-loadMappings();
+loadMappings();// Reset both players + wipe localStorage
+document.getElementById("reset-all").addEventListener("click", () => {
+    resetToDefault(1);
+    resetToDefault(2);
+    localStorage.removeItem("nes-input-mappings");
+});
