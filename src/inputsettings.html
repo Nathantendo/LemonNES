@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>NES Input Settings</title>
+  <style>
+    body { font-family: sans-serif; background: #111; color: #eee; }
+    h2 { margin-top: 20px; }
+    .player { margin-bottom: 30px; }
+    .mapping { margin: 5px 0; }
+    button { padding: 5px 10px; margin-left: 10px; }
+    .waiting { background: #c33; color: white; }
+  </style>
+</head>
+<body>
+  <h1>NES Input Settings</h1>
+
+  <div class="player" id="p1">
+    <h2>Player 1</h2>
+    <div class="mapping">A: <span id="p1-A">KeyZ</span> <button data-player="1" data-btn="A">Remap</button></div>
+    <div class="mapping">B: <span id="p1-B">KeyX</span> <button data-player="1" data-btn="B">Remap</button></div>
+    <div class="mapping">Select: <span id="p1-Select">ShiftLeft</span> <button data-player="1" data-btn="Select">Remap</button></div>
+    <div class="mapping">Start: <span id="p1-Start">Enter</span> <button data-player="1" data-btn="Start">Remap</button></div>
+    <div class="mapping">Up: <span id="p1-Up">ArrowUp</span> <button data-player="1" data-btn="Up">Remap</button></div>
+    <div class="mapping">Down: <span id="p1-Down">ArrowDown</span> <button data-player="1" data-btn="Down">Remap</button></div>
+    <div class="mapping">Left: <span id="p1-Left">ArrowLeft</span> <button data-player="1" data-btn="Left">Remap</button></div>
+    <div class="mapping">Right: <span id="p1-Right">ArrowRight</span> <button data-player="1" data-btn="Right">Remap</button></div>
+  </div>
+
+  <div class="player" id="p2">
+    <h2>Player 2</h2>
+    <div class="mapping">A: <span id="p2-A">Numpad1</span> <button data-player="2" data-btn="A">Remap</button></div>
+    <div class="mapping">B: <span id="p2-B">Numpad2</span> <button data-player="2" data-btn="B">Remap</button></div>
+    <div class="mapping">Select: <span id="p2-Select">Numpad0</span> <button data-player="2" data-btn="Select">Remap</button></div>
+    <div class="mapping">Start: <span id="p2-Start">NumpadEnter</span> <button data-player="2" data-btn="Start">Remap</button></div>
+    <div class="mapping">Up: <span id="p2-Up">Numpad8</span> <button data-player="2" data-btn="Up">Remap</button></div>
+    <div class="mapping">Down: <span id="p2-Down">Numpad5</span> <button data-player="2" data-btn="Down">Remap</button></div>
+    <div class="mapping">Left: <span id="p2-Left">Numpad4</span> <button data-player="2" data-btn="Left">Remap</button></div>
+    <div class="mapping">Right: <span id="p2-Right">Numpad6</span> <button data-player="2" data-btn="Right">Remap</button></div>
+  </div>
+
+  <script type="module" src="inputSettings.js"></script>
+</body>
+</html>
