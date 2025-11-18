@@ -34,4 +34,6 @@ The Following Games Have Been Tested With LemonNES
 LemonNES Is Currently In Beta, If You Find Any Issues With The Code, Please Report Them By Creating A Pull Request.
 
 # Disclaimer
- NES is a trademark of Nintendo. LemonNES isn't associated with Nintendo in any way.
+NES is a trademark of Nintendo. LemonNES isn't associated with Nintendo in any way.
+This Software Should Not Be Used To Run Pirated Games. By Using This Software, You Accept Full Responsibilty Over How You Emulate.
+Only Obtain Games Through Dumping Your Legal Copies Using Hardware And Software Tools.
