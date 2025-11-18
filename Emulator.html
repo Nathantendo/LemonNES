@@ -706,12 +706,25 @@
         if(this.cycle===257){ this.copyX(); }
         if(this.cycle===256){ this.incY(); }
       }
-      if(this.scanline===241 && this.cycle===1){
-        this.status |= 0x80; if(this.ctrl & 0x80){ this.nmi=true; }
-        // This is a good place to blit to the visible canvas (graphics fix)
-        this.ctx.putImageData(this.output,0,0);
-      }
-      this.cycle++; if(this.cycle>340){ this.cycle=0; this.scanline++; if(this.scanline>261){ this.scanline=0; this.frame++; } }
+      if (this.scanline === 240 && this.cycle === 1) {
+    this.ctx.putImageData(this.output,0,0);
+}
+     this.cycle++;
+if(this.cycle>340){
+    this.cycle=0;
+    this.scanline++;
+    if(this.scanline>261){
+        this.scanline=0;
+        this.frame++;// Odd frame cycle skip
+if (this.scanline === 261 && this.frame % 2 === 1 && (this.mask & 0x18)) {
+    if (this.cycle === 339) {
+        this.cycle = 0;
+        this.scanline = 0;
+        this.frame++;
+        return;
+    }
+}
+    
     }
   }
 
@@ -919,10 +932,13 @@
         for (let f = 0; f < framesToRun; ++f) {
           // Run one NES frame: 29780 CPU cycles (for NTSC, approx 60Hz)
           let cpuCycles = 0;
-          while (cpuCycles < 29780) {
-            cpuCycles += this.cpu.step();
-            for (let i = 0; i < 3; i++) {
-              this.ppu.step();
+          // Real NTSC CPU cycles per frame:
+const CPU_PER_FRAME = 29780.5 / 3;  // ≈ 9934
+
+while (cpuCycles < CPU_PER_FRAME) {
+    cpuCycles += this.cpu.step();
+    for (let i = 0; i < 3; i++) this.ppu.step();
+} {
               if (this.ppu.nmi) {
                 this.cpu.nmi();
                 this.ppu.nmi = false;
